@@ -3,7 +3,10 @@ use quote::ToTokens;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap as Map, BTreeSet as Set};
 use syn::punctuated::Punctuated;
-use syn::{parse_quote, GenericArgument, Generics, Ident, PathArguments, Token, Type, WhereClause};
+use syn::{
+    parse_quote, GenericArgument, Generics, Ident, PathArguments, Token, Type, WhereClause,
+    WherePredicate,
+};
 
 pub struct ParamsInScope<'a> {
     names: Set<&'a Ident>,
@@ -32,18 +35,23 @@ fn crawl(in_scope: &ParamsInScope, ty: &Type, found: &mut bool) {
                 }
             }
         }
-        for segment in &ty.path.segments {
-            if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
-                for arg in &arguments.args {
-                    if let GenericArgument::Type(ty) = arg {
-                        crawl(in_scope, ty, found);
-                    }
-                }
-            }
-        }
+        ty.path
+            .segments
+            .iter()
+            .filter_map(|segment| match &segment.arguments {
+                PathArguments::AngleBracketed(arguments) => Some(&arguments.args),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|arg| match arg {
+                GenericArgument::Type(ty) => Some(ty),
+                _ => None,
+            })
+            .for_each(|ty| crawl(in_scope, ty, found));
     }
 }
 
+#[derive(Default)]
 pub struct InferredBounds {
     bounds: Map<String, (Set<String>, Punctuated<TokenStream, Token![+]>)>,
     order: Vec<TokenStream>,
@@ -51,13 +59,9 @@ pub struct InferredBounds {
 
 impl InferredBounds {
     pub fn new() -> Self {
-        InferredBounds {
-            bounds: Map::new(),
-            order: Vec::new(),
-        }
+        Self::default()
     }
 
-    #[allow(clippy::type_repetition_in_bounds, clippy::trait_duplication_in_bounds)] // clippy bug: https://github.com/rust-lang/rust-clippy/issues/8771
     pub fn insert(&mut self, ty: impl ToTokens, bound: impl ToTokens) {
         let ty = ty.to_token_stream();
         let bound = bound.to_token_stream();
@@ -74,10 +78,19 @@ impl InferredBounds {
     pub fn augment_where_clause(&self, generics: &Generics) -> WhereClause {
         let mut generics = generics.clone();
         let where_clause = generics.make_where_clause();
-        for ty in &self.order {
-            let (_set, bounds) = &self.bounds[&ty.to_string()];
-            where_clause.predicates.push(parse_quote!(#ty: #bounds));
-        }
+        where_clause
+            .predicates
+            .extend(self.order.iter().map(|ty| -> WherePredicate {
+                let (_set, bounds) = &self.bounds[&ty.to_string()];
+                parse_quote!(#ty: #bounds)
+            }));
         generics.where_clause.unwrap()
+    }
+}
+
+impl<T: ToTokens, B: ToTokens> Extend<(T, B)> for InferredBounds {
+    fn extend<I: IntoIterator<Item = (T, B)>>(&mut self, iter: I) {
+        iter.into_iter()
+            .for_each(|(ty, bound)| self.insert(ty, bound));
     }
 }

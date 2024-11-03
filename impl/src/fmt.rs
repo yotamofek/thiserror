@@ -1,5 +1,6 @@
 use crate::ast::Field;
 use crate::attr::{Display, Trait};
+use crate::scan_expr::scan_expr;
 use proc_macro2::TokenTree;
 use quote::{format_ident, quote_spanned};
 use std::collections::{BTreeSet as Set, HashMap as Map};
@@ -12,10 +13,11 @@ impl Display<'_> {
     pub fn expand_shorthand(&mut self, fields: &[Field]) {
         let raw_args = self.args.clone();
         let mut named_args = explicit_named_args.parse2(raw_args).unwrap();
-        let mut member_index = Map::new();
-        for (i, field) in fields.iter().enumerate() {
-            member_index.insert(&field.member, i);
-        }
+        let member_index = fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| (&field.member, i))
+            .collect::<Map<_, _>>();
 
         let span = self.fmt.span();
         let fmt = self.fmt.value();
@@ -93,11 +95,6 @@ impl Display<'_> {
             if formatvar.to_string().starts_with("r#") {
                 formatvar = format_ident!("r_{}", formatvar);
             }
-            if formatvar.to_string().starts_with('_') {
-                // Work around leading underscore being rejected by 1.40 and
-                // older compilers. https://github.com/rust-lang/rust/pull/66847
-                formatvar = format_ident!("field_{}", formatvar);
-            }
             out += &formatvar.to_string();
             if !named_args.insert(formatvar.clone()) {
                 // Already specified in the format argument list.
@@ -126,30 +123,27 @@ fn explicit_named_args(input: ParseStream) -> Result<Set<Ident>> {
     let mut named_args = Set::new();
 
     while !input.is_empty() {
-        if input.peek(Token![,]) && input.peek2(Ident::peek_any) && input.peek3(Token![=]) {
-            input.parse::<Token![,]>()?;
+        input.parse::<Token![,]>()?;
+        if input.is_empty() {
+            break;
+        }
+        if input.peek(Ident::peek_any) && input.peek2(Token![=]) && !input.peek2(Token![==]) {
             let ident = input.call(Ident::parse_any)?;
             input.parse::<Token![=]>()?;
             named_args.insert(ident);
-        } else {
-            input.parse::<TokenTree>()?;
         }
+        scan_expr(input)?;
     }
 
     Ok(named_args)
 }
 
 fn take_int(read: &mut &str) -> String {
-    let mut int = String::new();
-    for (i, ch) in read.char_indices() {
-        match ch {
-            '0'..='9' => int.push(ch),
-            _ => {
-                *read = &read[i..];
-                break;
-            }
-        }
-    }
+    let end = read
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or_default();
+    let int = read[..end].to_string();
+    *read = &read[end..];
     int
 }
 
@@ -160,14 +154,10 @@ fn take_ident(read: &mut &str) -> Ident {
         ident.push_str("r#");
         *read = &read[2..];
     }
-    for (i, ch) in read.char_indices() {
-        match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => ident.push(ch),
-            _ => {
-                *read = &read[i..];
-                break;
-            }
-        }
-    }
+    let end = read
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or_default();
+    ident.push_str(&read[..end]);
+    *read = &read[end..];
     Ident::parse_any.parse_str(&ident).unwrap()
 }
